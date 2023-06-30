@@ -1,6 +1,7 @@
 from typing import Dict, Any, Optional, cast, Iterator, Tuple, Final
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.fx as fx
 from plinio.graph.features_calculation import ConstFeaturesCalculator, FeaturesCalculator, ModAttrFeaturesCalculator
 from .features_masker import PITFeaturesMasker
@@ -16,6 +17,7 @@ class PITAttention(nn.Module, PITModule):
                  binarization_threshold: float = 0.5,
                  qkv_bias: bool = False,
                  out_bias: bool = False,
+                 fused_attention: bool = False,
                  ):
         super(PITAttention, self).__init__()
         self.hidden_dim = hidden_dim
@@ -27,6 +29,7 @@ class PITAttention(nn.Module, PITModule):
         self.qk_features_masker = PITFeaturesMasker(self.hidden_dim)
         self.v_features_masker = PITFeaturesMasker(self.hidden_dim)
         self.output_features_masker = PITFeaturesMasker(self.hidden_dim)
+        self.fused_attention = fused_attention
         
         self.q_proj = PITLinear(nn.Linear(hidden_dim, hidden_dim, bias=qkv_bias), \
                                 self.qk_features_masker, binarization_threshold=binarization_threshold)
@@ -42,18 +45,22 @@ class PITAttention(nn.Module, PITModule):
 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, C = x.shape
         q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
         q = q.reshape(*q.shape[:-1], self.n_heads, self.head_dim).transpose(-2, -3)
         k = k.reshape(*k.shape[:-1], self.n_heads, self.head_dim).transpose(-2, -3)
         v = v.reshape(*v.shape[:-1], self.n_heads, self.head_dim).transpose(-2, -3)
-        
-        q = q * self.scale_factor
-        attention = q @ k.transpose(-2, -1)
-        attention = torch.softmax(attention, dim=-1)
-
-        x = (attention @ v).transpose(-2, -3).reshape(*x.shape)
+       
+        if self.fused_attention:
+            x = F.scaled_dot_product_attention(q, k, v) 
+        else:
+            q = q * self.scale_factor
+            attention = q @ k.transpose(-2, -1)
+            attention = torch.softmax(attention, dim=-1)
+            x = attention @ v
+        x = x.transpose(-2, -3).reshape(B, N, C)
         x = self.out_proj(x)
         return x
 

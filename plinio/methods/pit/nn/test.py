@@ -142,7 +142,6 @@ def test_copy_timm_attention():
         attention = block.attn
         hidden_dim = attention.num_heads * attention.head_dim
         pit_attention = attention_to_pit(attention)
-        attention.fused_attn = False
         attention.eval()
         pit_attention.eval()
         x = torch.randn(1, (384 // 16) ** 2  + 1, hidden_dim)
@@ -165,7 +164,6 @@ def test_copy_timm_block():
         pit_block = block_to_pit(block)
         in_dim = block.mlp.fc1.weight.shape[1]
         x = torch.randn(1, (384 // 16) ** 2  + 1, in_dim)
-        block.attn.fused_attn = False
         block.eval()
         pit_block.eval()
         assert torch.allclose(block(x), pit_block(x)), f"Block {i} failed"
@@ -205,7 +203,8 @@ def attention_to_pit(attention: Attention) -> PITAttention:
     hidden_dim = attention.num_heads * attention.head_dim
     qkv_bias = attention.qkv.bias is not None
     out_bias = attention.proj.bias is not None
-    pit = PITAttention(hidden_dim, attention.num_heads, qkv_bias=qkv_bias, out_bias=out_bias)
+    fused_attn = attention.fused_attn
+    pit = PITAttention(hidden_dim, attention.num_heads, qkv_bias=qkv_bias, out_bias=out_bias, fused_attention=fused_attn)
     pit.q_proj.weight.data, pit.k_proj.weight.data, pit.v_proj.weight.data= attention.qkv.weight.data.chunk(3)
     if qkv_bias:
         pit.q_proj.bias.data, pit.k_proj.bias.data, pit.v_proj.bias.data= attention.qkv.bias.data.chunk(3)
@@ -251,8 +250,6 @@ def vit_to_pit(vit, image_size):
 
 def test_vit_to_pit():
     model = timm.create_model('vit_tiny_patch16_384', pretrained=True)
-    for block in model.blocks.children():
-        block.attn.fused_attn = False
     pit_model = vit_to_pit(model, (384,) * 2)
     x = torch.randn(1, 3, 384, 384)
     x_tokens = torch.ones(1, (384 // 16) ** 2 + 1, 192)
