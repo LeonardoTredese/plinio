@@ -22,6 +22,6 @@ from .conv2d import PITConv2d
 from .linear import PITLinear
 from .batchnorm_1d import PITBatchNorm1d
 from .batchnorm_2d import PITBatchNorm2d
-from .mhsa import PITMHSA
+from .transformer import PITAttention, PITMlp, PITBlock, PITPatchEmbedding, PITVIT
 
-__all__ = ['PITModule', 'PITConv1d', 'PITConv2d', 'PITLinear', 'PITBatchNorm1d', 'PITBatchNorm2d', 'PITMHSA']
+__all__ = ['PITModule', 'PITConv1d', 'PITConv2d', 'PITLinear', 'PITBatchNorm1d', 'PITBatchNorm2d', 'PITAttention', 'PITMlp', 'PITBlock', 'PITPatchEmbedding', 'PITVIT']
