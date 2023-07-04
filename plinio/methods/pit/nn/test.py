@@ -4,6 +4,7 @@ import timm
 from typing import Final
 from functools import partial
 from plinio.methods.pit.nn import PITAttention, PITModule, PITLinear, PITMlp, PITBlock, PITPatchEmbedding, PITVIT
+from plinio.graph.features_calculation import ConstFeaturesCalculator, FeaturesCalculator, ModAttrFeaturesCalculator
 from plinio.methods.pit.nn.features_masker import PITFeaturesMasker
 from plinio.methods.pit.nn.binarizer import PITBinarizer
 
@@ -237,8 +238,10 @@ def vit_to_pit(vit, image_size):
     pit_vit.cls_token.data = vit.cls_token.data
     pit_vit.pos_embedding.data = vit.pos_embed.data
     pit_vit.patch_embedding = embed_to_pit(vit.patch_embed, image_size)
+    embed_features_calculator = ModAttrFeaturesCalculator(pit_vit.patch_embedding, 'out_features_opt', 'features_mask')
     for i, block in enumerate(vit.blocks.children()):
         pit_vit.blocks[i] = block_to_pit(block)
+        pit_vit.blocks[i].input_features_calculator = embed_features_calculator
     pit_vit.norm.load_state_dict(vit.norm.state_dict())
     pit_vit.norm.eps = vit.norm.eps
     pit_vit.head.weight.data = vit.head.weight.data
@@ -356,36 +359,31 @@ def test_weight_gradient():
         assert torch.any(param.grad != 0), f"param {name} has all zeros gradient"
 
 def test_nas_gradient():
-    hidden_dim = 384
-    n_heads = 12
-    seq_len = 20
-    batch_size = 32
-    epochs = 100
-    classification_head = nn.Linear(hidden_dim, 4)
-    attention = PITAttention(hidden_dim, n_heads)
-    x = torch.randn(batch_size, seq_len, hidden_dim)
-    x = attention(x)
-    loss = attention.get_size()
+    x = torch.randn(1, 3, 384, 384)
+    model = timm.create_model('vit_tiny_patch16_384', pretrained=True, num_classes=10)
+    pit_model = vit_to_pit(model, x.shape[-2:])
+    pit_model(x)
+    loss = pit_model.get_size()
     loss.backward()
-    nas_names = {name for name, _ in attention.named_nas_parameters()}
-    for name, param in attention.named_nas_parameters():
+    nas_names = {name for name, _ in pit_model.named_nas_parameters()}
+    for name, param in pit_model.named_nas_parameters():
         assert param.grad is not None, f"param {name} has no gradient"
         assert torch.any(param.grad != 0), f"param {name} has all zeros gradient"
-    for name, param in attention.named_parameters():
+    for name, param in pit_model.named_parameters():
         if name not in nas_names:
             assert param.grad is None or torch.all(param.grad == 0), f"param {name} aren't all zeros gradient" 
 
 def main():
-    test_copy_timm_embed()
-    test_copy_timm_block()
-    test_vit_to_pit() 
+    test_nas_gradient()
     test_qk_same_mask()
     test_weight_gradient()
-    test_nas_gradient()
     test_attention_output()
     test_attention_to_pit()
     test_copy_timm_attention()
     test_copy_timm_mlp()
+    test_copy_timm_embed()
+    test_copy_timm_block()
+    test_vit_to_pit() 
 
 if __name__ == "__main__":
     main()

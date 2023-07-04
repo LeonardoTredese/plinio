@@ -131,10 +131,8 @@ class PITMlp(nn.Module, PITModule):
         self.d_model = d_model
         self.scale = scale
         hidden_dim = int(d_model * scale)
-        self.mask_1 = PITFeaturesMasker(hidden_dim)
-        self.mask_2 = PITFeaturesMasker(d_model)
-        self.fc_1 = PITLinear(nn.Linear(d_model, hidden_dim, bias=bias), self.mask_1)
-        self.fc_2 = PITLinear(nn.Linear(hidden_dim, d_model, bias=bias), self.mask_2)
+        self.fc_1 = PITLinear(nn.Linear(d_model, hidden_dim, bias=bias), PITFeaturesMasker(hidden_dim))
+        self.fc_2 = PITLinear(nn.Linear(hidden_dim, d_model, bias=bias), PITFeaturesMasker(d_model))
         fc1_features_calculator = ModAttrFeaturesCalculator(self.fc_1, 'out_features_opt', 'features_mask')
         self.fc_2.input_features_calculator = fc1_features_calculator
         self.activation = nn.GELU()
@@ -177,9 +175,9 @@ class PITMlp(nn.Module, PITModule):
 
     def named_nas_parameters(self, recurse: bool = False) -> Iterator[Tuple[str, nn.Parameter]]:
         for name, param in self.fc_1.named_nas_parameters(recurse=recurse):
-            yield name, param
+            yield f"fc_1.{name}", param
         for name, param in self.fc_2.named_nas_parameters(recurse=recurse):
-            yield name, param
+            yield f"fc_2.{name}", param
 
     def nas_parameters(self, recurse: bool = False) -> Iterator[nn.Parameter]:
         for _, param in self.named_nas_parameters(recurse=recurse):
@@ -216,8 +214,6 @@ class PITBlock(nn.Module, PITModule):
             bias=True,
         )
 
-        self.mlp.in_features_calculator = ModAttrFeaturesCalculator(self.attn, 'out_features_opt', 'features_mask')
-
     def forward(self, x):
         x = x + self.attn(self.norm1(x))
         x = x + self.mlp(self.norm2(x))
@@ -242,6 +238,7 @@ class PITBlock(nn.Module, PITModule):
     @input_features_calculator.setter
     def input_features_calculator(self, calc: FeaturesCalculator):
         self.attn.input_features_calculator = calc
+        self.mlp.input_features_calculator = calc
 
     def get_size(self):
         return self.attn.get_size() + self.mlp.get_size()
@@ -251,9 +248,9 @@ class PITBlock(nn.Module, PITModule):
 
     def named_nas_parameters(self, recurse: bool = False) -> Iterator[Tuple[str, nn.Parameter]]:
         for name, param in self.attn.named_nas_parameters(recurse=recurse):
-            yield name, param
+            yield f"attn.{name}", param
         for name, param in self.mlp.named_nas_parameters(recurse=recurse):
-            yield name, param
+            yield f"mlp.{name}", param
 
     def nas_parameters(self, recurse: bool = False) -> Iterator[nn.Parameter]:
         for _, param in self.named_nas_parameters(recurse=recurse):
@@ -290,19 +287,20 @@ class PITPatchEmbedding(nn.Module, PITModule):
         self.conv.input_features_calculator = calc
     
     def get_size(self):
-        return self.in_features_opt * self.out_features_opt
+        return self.conv.out_features_eff * 3
 
     def get_macs(self):
         return 0
 
     def named_nas_parameters(self, recurse: bool = False) -> Iterator[Tuple[str, nn.Parameter]]:
-        return self.conv.named_nas_parameters()
+        for name, param in self.conv.named_nas_parameters():
+            yield f"conv.{name}", param
     
     def nas_parameters(self, recurse: bool = False) -> Iterator[nn.Parameter]:
         for _, param in self.named_nas_parameters(recurse=recurse):
             yield param
 
-class PITVIT(nn.Module):
+class PITVIT(nn.Module, PITModule):
     def __init__(self, image_size, patch_size, n_layers, n_heads, d_model, ff_scale, dropout, n_classes, bias):
         super().__init__()
         self.n_layers = n_layers
@@ -323,8 +321,8 @@ class PITVIT(nn.Module):
         self.embed_dropout = nn.Dropout(dropout)
         self.blocks = nn.Sequential(*[PITBlock(d_model, n_heads, mlp_ratio=ff_scale, proj_drop=dropout, qkv_bias=bias, out_bias=bias) for _ in range(n_layers)])
         embed_features_calculator = ModAttrFeaturesCalculator(self.patch_embedding, 'out_features_opt', 'features_mask')
-        for layer in self.blocks.children():
-            layer.input_features_calculator = embed_features_calculator
+        for i in range(n_layers):
+            self.blocks[i].input_features_calculator = embed_features_calculator
         self.norm = nn.LayerNorm(d_model)
         self.head_dropout = nn.Dropout(dropout)
         self.head = nn.Linear(d_model, n_classes, bias = bias)
@@ -350,6 +348,42 @@ class PITVIT(nn.Module):
 
     def get_size(self):
         size = self.patch_embedding.get_size() 
-        for layer in self.blocks.children():
-            size += layer.get_size()
+        for layer in range(self.n_layers):
+            block = self.blocks[layer]
+            size += block.get_size()
         return size
+
+    @property
+    def in_features_opt(self):
+        return 3
+
+    def get_macs(self):
+        return 0
+
+    @property
+    def out_features_opt(self):
+        return self.n_classes
+
+    @property
+    def features_mask(self):
+        return torch.ones_like(self.head.weight)
+
+    @property
+    def input_features_calculator(self) -> FeaturesCalculator:
+        return self.conv.input_features_calculator
+
+    @input_features_calculator.setter
+    def input_features_calculator(self, calc: FeaturesCalculator):
+        self.conv.input_features_calculator = calc
+
+    def named_nas_parameters(self, recurse: bool = False) -> Iterator[Tuple[str, nn.Parameter]]:
+        for name, param in self.patch_embedding.named_nas_parameters(recurse=recurse):
+            yield f"patch_embedding.{name}", param
+        for layer in range(self.n_layers):
+            block = self.blocks[layer]
+            for name, param in block.named_nas_parameters(recurse=recurse):
+                yield f"blocks.{layer}.{name}", param
+    
+    def nas_parameters(self, recurse: bool = False) -> Iterator[nn.Parameter]:
+        for _, param in self.named_nas_parameters(recurse=recurse):
+            yield param
