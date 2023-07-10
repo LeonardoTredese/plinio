@@ -287,7 +287,7 @@ class PITPatchEmbedding(nn.Module, PITModule):
         self.conv.input_features_calculator = calc
     
     def get_size(self):
-        return self.conv.out_features_eff * 3
+        return self.conv.out_features_eff * 3 * self.patch_size[0] * self.patch_size[1]
 
     def get_macs(self):
         return 0
@@ -347,7 +347,7 @@ class PITVIT(nn.Module, PITModule):
         return x
 
     def get_size(self):
-        size = self.patch_embedding.get_size() 
+        size = self.patch_embedding.get_size() + self.head.weight.numel()
         for layer in range(self.n_layers):
             block = self.blocks[layer]
             size += block.get_size()
