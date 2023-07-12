@@ -90,8 +90,11 @@ class PITAttention(nn.Module, PITModule):
     def v_features_mask(self) -> torch.Tensor:
         return self.__feature_mask(self.v_features_masker)
 
-    def get_size(self) -> int:
+    def get_size(self) -> float:
         return self.q_proj.get_size() + self.k_proj.get_size() + self.v_proj.get_size() + self.out_proj.get_size()
+
+    def get_size_binarized(self) -> int:
+        return self.q_proj.get_size_binarized() + self.k_proj.get_size_binarized() + self.v_proj.get_size_binarized() + self.out_proj.get_size_binarized()
     
     # TODO: implement
     def get_macs(self) -> int:
@@ -167,8 +170,11 @@ class PITMlp(nn.Module, PITModule):
     def input_features_calculator(self, calc: FeaturesCalculator):
         self.fc_1.input_features_calculator = calc
 
-    def get_size(self):
+    def get_size(self) -> float:
         return self.fc_1.get_size() + self.fc_2.get_size()
+
+    def get_size_binarized(self) -> int:
+        return self.fc_1.get_size_binarized() + self.fc_2.get_size_binarized()
 
     def get_macs(self):
         return 0
@@ -240,8 +246,11 @@ class PITBlock(nn.Module, PITModule):
         self.attn.input_features_calculator = calc
         self.mlp.input_features_calculator = calc
 
-    def get_size(self):
+    def get_size(self) -> float:
         return self.attn.get_size() + self.mlp.get_size()
+
+    def get_size_binarized(self) -> int:
+        return self.attn.get_size_binarized() + self.mlp.get_size_binarized()
 
     def get_macs(self):
         return self.attn.get_macs() + self.mlp.get_macs()
@@ -286,8 +295,11 @@ class PITPatchEmbedding(nn.Module, PITModule):
     def input_features_calculator(self, calc: FeaturesCalculator):
         self.conv.input_features_calculator = calc
     
-    def get_size(self):
+    def get_size(self) -> float:
         return self.conv.out_features_eff * 3 * self.patch_size[0] * self.patch_size[1]
+
+    def get_size_binarized(self) -> int:
+        return self.conv.out_features_opt * 3 * self.patch_size[0] * self.patch_size[1]
 
     def get_macs(self):
         return 0
@@ -346,11 +358,18 @@ class PITVIT(nn.Module, PITModule):
         x = self.head(x)
         return x
 
-    def get_size(self):
+    def get_size(self) -> float:
         size = self.patch_embedding.get_size() + self.head.weight.numel()
         for layer in range(self.n_layers):
             block = self.blocks[layer]
             size += block.get_size()
+        return size
+
+    def get_size_binarized(self) -> int:
+        size = self.patch_embedding.get_size_binarized() + self.head.weight.numel()
+        for layer in range(self.n_layers):
+            block = self.blocks[layer]
+            size += block.get_size_binarized()
         return size
 
     @property

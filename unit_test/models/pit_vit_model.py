@@ -81,7 +81,7 @@ def evaluate(model, data_loader):
             correct += pred.eq(target.view_as(pred)).sum().item()
         loss = loss / len(data_loader.dataset)
         correct /= len(data_loader.dataset)
-        return loss, correct, model.get_size()
+        return loss, correct, model.get_size_binarized()
 
 def train(epoch, model, optimizer, scheduler, criterion, size_lambda, frequency=10):
     model.train()
