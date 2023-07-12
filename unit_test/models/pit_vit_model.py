@@ -4,6 +4,7 @@ import plinio.methods.pit.nn as pnn
 from plinio.methods.pit.nn.features_masker import PITFeaturesMasker
 from plinio.graph.features_calculation import ModAttrFeaturesCalculator, FeaturesCalculator
 from plinio.methods.pit.nn.test import vit_to_pit
+from plinio.methods.pit.nn import PITConv2d, PITLinear
 import torchvision
 import torch.optim as optim
 import torchvision.transforms as transforms
@@ -28,7 +29,7 @@ config = {
     'learning_rate': 1e-4,
     'weight_decay': 5e-2,
     'epochs': 500,
-    'size_lambda': 1e-4,
+    'size_lambda': 1e-8,
     'weight_update_frequency': 10,
     'image_size': 384,
     'patch_size': 16,
@@ -55,9 +56,14 @@ test_loader = torch.utils.data.DataLoader(test_ds, batch_size=batch_size, shuffl
 base_model = timm.create_model(config['base_model'], pretrained=True, num_classes=10)
 model = vit_to_pit(base_model, (384,) * 2).to(device)
 optimizer = optim.AdamW(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
-scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['epochs'])
+scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=4, T_mult=1, eta_min=1e-8)
 criterion = SoftTargetCrossEntropy()
 
+# set the nas parameters to the binarizer threshold
+with torch.no_grad():
+    threshold = 0.5
+    for p in model.nas_parameters():
+        p.fill_(threshold + 1e-3)
 
 def evaluate(model, data_loader):
     model.eval()
@@ -97,7 +103,10 @@ def train(epoch, model, optimizer, scheduler, criterion, size_lambda, frequency=
             scaler.update()
             optimizer.zero_grad()
     scheduler.step()
- 
+
+def add_prefix(prefix, d):
+    return {prefix + key: value for key, value in d.items()}
+
 # initialize wandb
 wandb.init(project='pit-vit', config=config)
 wandb.watch(model)
@@ -108,5 +117,10 @@ for epoch in range(config['epochs']):
     print(f"TRAIN loss: {train_loss}, accuracy: {train_accuracy}")
     test_loss, test_accuracy, model_size = evaluate(model, test_loader)
     print(f"TEST loss: {test_loss}, accuracy: {test_accuracy}, model size: {model_size}")
-    wandb.log({'train_loss': train_loss, 'train_accuracy': train_accuracy, 'test_loss': test_loss, 'test_accuracy': test_accuracy, 'model_size': model_size})
+    metrics = {'train_loss': train_loss, 'train_accuracy': train_accuracy, 'test_loss': test_loss, 'test_accuracy': test_accuracy, 'model_size': model_size}
+    layers_params = dict()
+    for name, param in model.named_modules():
+        if isinstance(param, PITConv2d) or isinstance(param, PITLinear):
+            layers_params[f"{name}"] = param.out_features_opt
+    wandb.log(add_prefix("metrics/", metrics) | add_prefix("layers_masks/", layers_params))
 wandb.finish()
