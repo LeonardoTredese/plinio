@@ -238,10 +238,11 @@ def vit_to_pit(vit, image_size):
     pit_vit.cls_token.data = vit.cls_token.data
     pit_vit.pos_embedding.data = vit.pos_embed.data
     pit_vit.patch_embedding = embed_to_pit(vit.patch_embed, image_size)
-    embed_features_calculator = ModAttrFeaturesCalculator(pit_vit.patch_embedding, 'out_features_opt', 'features_mask')
+    prev_features_calculator = ModAttrFeaturesCalculator(pit_vit.patch_embedding, 'out_features_opt', 'features_mask')
     for i, block in enumerate(vit.blocks.children()):
         pit_vit.blocks[i] = block_to_pit(block)
-        pit_vit.blocks[i].input_features_calculator = embed_features_calculator
+        pit_vit.blocks[i].input_features_calculator = prev_features_calculator
+        prev_features_calculator = ModAttrFeaturesCalculator(pit_vit.blocks[i], 'out_features_opt', 'features_mask')
     pit_vit.norm.load_state_dict(vit.norm.state_dict())
     pit_vit.norm.eps = vit.norm.eps
     pit_vit.head.weight.data = vit.head.weight.data

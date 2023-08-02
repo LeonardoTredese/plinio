@@ -211,7 +211,6 @@ class PITBlock(nn.Module, PITModule):
             qkv_bias=qkv_bias,
             out_bias=out_bias,
         )
-
         self.norm2 = norm_layer(dim)
         self.mlp = mlp_layer(
             dim,
@@ -219,10 +218,17 @@ class PITBlock(nn.Module, PITModule):
             proj_drop,
             bias=True,
         )
+        self.mlp.inpu_features_calculator = ModAttrFeaturesCalculator(self.attn, 'out_features_opt', 'features_mask')
 
     def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
+        attn_out = self.attn.out_proj
+        theta_alpha = attn_out.out_features_masker.theta
+        attn_mask = PITBinarizer.apply(theta_alpha, attn_out._binarization_threshold)
+        mlp_out = self.mlp.fc_2
+        theta_alpha = mlp_out.out_features_masker.theta
+        mlp_mask = PITBinarizer.apply(theta_alpha, mlp_out._binarization_threshold)
+        x = torch.mul(x, attn_mask) + self.attn(self.norm1(x))
+        x = torch.mul(x, mlp_mask) + self.mlp(self.norm2(x))
         return x
 
     @property
@@ -244,7 +250,7 @@ class PITBlock(nn.Module, PITModule):
     @input_features_calculator.setter
     def input_features_calculator(self, calc: FeaturesCalculator):
         self.attn.input_features_calculator = calc
-        self.mlp.input_features_calculator = calc
+        self.mlp.input_features_calculator = ModAttrFeaturesCalculator(self.attn, 'out_features_opt', 'features_mask')
 
     def get_size(self) -> float:
         return self.attn.get_size() + self.mlp.get_size()
@@ -332,9 +338,10 @@ class PITVIT(nn.Module, PITModule):
         nn.init.trunc_normal_(self.pos_embedding, std=0.2)
         self.embed_dropout = nn.Dropout(dropout)
         self.blocks = nn.Sequential(*[PITBlock(d_model, n_heads, mlp_ratio=ff_scale, proj_drop=dropout, qkv_bias=bias, out_bias=bias) for _ in range(n_layers)])
-        embed_features_calculator = ModAttrFeaturesCalculator(self.patch_embedding, 'out_features_opt', 'features_mask')
+        prev_features_calculator = ModAttrFeaturesCalculator(self.patch_embedding, 'out_features_opt', 'features_mask')
         for i in range(n_layers):
-            self.blocks[i].input_features_calculator = embed_features_calculator
+            self.blocks[i].input_features_calculator = prev_features_calculator
+            prev_features_calculator = ModAttrFeaturesCalculator(self.blocks[i], 'out_features_opt', 'features_mask')
         self.norm = nn.LayerNorm(d_model)
         self.head_dropout = nn.Dropout(dropout)
         self.head = nn.Linear(d_model, n_classes, bias = bias)
