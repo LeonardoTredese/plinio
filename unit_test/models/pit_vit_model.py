@@ -15,7 +15,7 @@ from timm.data.mixup import Mixup
 from timm.data.random_erasing import RandomErasing
 from timm.utils import accuracy
 import pytorch_benchmarks.transformers.image_classification as icl
-from pytorch_benchmarks.utils import seed_all
+from pytorch_benchmarks.utils import seed_all, EarlyStopping
 import os
 from tqdm import tqdm
 import wandb
@@ -39,6 +39,7 @@ config = {
     'weight_update_frequency': 10,
     'image_size': 224,
     'patch_size': 16,
+    'checkpoint_frequency': 10,
 }
 
 
@@ -75,7 +76,7 @@ def evaluate(model, data_loader):
             correct += pred.eq(target.view_as(pred)).sum().item()
         loss = loss / len(data_loader.dataset)
         correct /= len(data_loader.dataset)
-        return loss, correct, model.get_size_binarized(), output
+        return loss, correct, model.get_size_binarized()
 
 def train(train_loader, model, optimizer, scheduler, criterion, size_lambda, frequency=10):
     model.train()
@@ -100,25 +101,43 @@ def train(train_loader, model, optimizer, scheduler, criterion, size_lambda, fre
 def add_prefix(prefix, d):
     return {prefix + key: value for key, value in d.items()}
 
+def checkpoint(model, optimizer, scheduler, name, epoch, config):
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler': scheduler.state_dict(),
+        'config': config
+    }, f"{name}_checkpoint_{epoch}.pt")
+
 # initialize wandb
-wandb.init(project='pit-vit', config=config)
+accuracy_stop = EarlyStopping(mode='max', patience=10)
+size_stop = EarlyStopping(mode='min', patience=10)
+run = wandb.init(project='pit-vit', config=config)
 wandb.watch(model)
 
 for epoch in range(config['epochs']):
     print(f"Epoch {epoch}")
     train(train_dl, model, optimizer, scheduler, criterion, size_lambda=config['size_lambda'], frequency=config['weight_update_frequency'])
-    train_loss, train_accuracy, _, train_output = evaluate(model, train_dl)
+    train_loss, train_accuracy, _, = evaluate(model, train_dl)
     print(f"TRAIN loss: {train_loss}, accuracy: {train_accuracy}")
-    val_loss, val_accuracy, model_size, val_output = evaluate(model, val_dl)
-    print(f"VAL loss: {val_loss}, accuracy: {val_accuracy}, model size: {model_size}")
-    metrics = {'train_loss': train_loss, 'train_accuracy': train_accuracy, 'val_loss': val_loss, 'val_accuracy': val_accuracy, 'model_size': model_size}
+    val_loss, val_accuracy, _ = evaluate(model, val_dl)
+    print(f"VAL loss: {val_loss}, accuracy: {val_accuracy}")
+    test_loss, test_accuracy, model_size = evaluate(model, test_dl)
+    print(f"TEST loss: {test_loss}, accuracy: {test_accuracy}, model size: {model_size}")
+    metrics = {'train_loss': train_loss, 'train_accuracy': train_accuracy,\
+               'val_loss': val_loss, 'val_accuracy': val_accuracy, \
+               'test_loss': test_loss, 'test_accuracy': test_accuracy, \
+               'model_size': model_size}
     layers_params = dict()
     for name, param in model.named_modules():
         if isinstance(param, PITConv2d) or isinstance(param, PITLinear):
             layers_params[f"{name}"] = param.out_features_opt
     wandb.log(add_prefix("metrics/", metrics) | add_prefix("layers_masks/", layers_params))
-print("Evaluating on test set...")
-test_loss, test_accuracy, model_size = evaluate(model, test_dl)
-print(f"TEST loss: {test_loss}, accuracy: {test_accuracy}, model size: {model_size}")
-wandb.log({'test_loss': test_loss, 'test_accuracy': test_accuracy, 'model_size': model_size})
+    if epoch and epoch % config['checkpoint_frequency'] == 0:
+        checkpoint(model, optimizer, scheduler, run.name, epoch, config)
+    if accuracy_stop(val_accuracy) and size_stop(model_size):
+        checkpoint(model, optimizer, scheduler, run.name, epoch, config)
+        print("Early stopping!")
+        break
 wandb.finish()
