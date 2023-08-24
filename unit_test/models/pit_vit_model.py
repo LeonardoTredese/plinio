@@ -28,8 +28,8 @@ seed = seed_all(seed=42)
 
 # configuration
 config = {
-    'base_model': 'vit_tiny_patch16_224',
-    'dataset': 'cifar10',
+    'base_model': 'vit_small_patch16_384',
+    'dataset': 'tiny-imagenet',
     'batch_size': 128,
     'learning_rate': 1e-4,
     'nas_learning_rate': 1e-2,
@@ -37,7 +37,7 @@ config = {
     'epochs': 500,
     'size_lambda': 1e-8,
     'weight_update_frequency': 10,
-    'image_size': 224,
+    'image_size': 384,
     'patch_size': 16,
     'checkpoint_frequency': 10,
 }
@@ -51,7 +51,7 @@ datasets = icl.get_data(dataset=config['dataset'], download=True, image_size=(im
 dataloaders = icl.build_dataloaders(datasets, batch_size=config['batch_size'], num_workers=os.cpu_count(), seed=seed)
 train_dl, val_dl, test_dl = dataloaders
 
-base_model = timm.create_model(config['base_model'], pretrained=True, num_classes=10)
+base_model = timm.create_model(config['base_model'], pretrained=True, num_classes=200)
 model = vit_to_pit(base_model, (image_size,) * 2).to(device)
 
 nas_names, nas_parameters = zip(*model.named_nas_parameters())
