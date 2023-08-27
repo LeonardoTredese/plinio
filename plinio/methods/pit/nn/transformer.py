@@ -9,6 +9,7 @@ from .binarizer import PITBinarizer
 from .module import PITModule
 from .linear import PITLinear
 from .conv2d import PITConv2d
+import timm
 
 class PITAttention(nn.Module, PITModule):
     def __init__(self,
@@ -43,6 +44,20 @@ class PITAttention(nn.Module, PITModule):
         v_proj_calculator = ModAttrFeaturesCalculator(self.v_proj, 'out_features_opt', 'features_mask')
         self.out_proj.input_features_calculator = v_proj_calculator
 
+    @staticmethod  
+    def from_timm(attention: timm.models.vision_transformer.Attention):
+        hidden_dim = attention.num_heads * attention.head_dim
+        qkv_bias = attention.qkv.bias is not None
+        out_bias = attention.proj.bias is not None
+        fused_attn = attention.fused_attn
+        pit = PITAttention(hidden_dim, attention.num_heads, qkv_bias=qkv_bias, out_bias=out_bias, fused_attention=fused_attn)
+        pit.q_proj.weight.data, pit.k_proj.weight.data, pit.v_proj.weight.data= attention.qkv.weight.data.chunk(3)
+        if qkv_bias:
+            pit.q_proj.bias.data, pit.k_proj.bias.data, pit.v_proj.bias.data= attention.qkv.bias.data.chunk(3)
+        pit.out_proj.weight.data = attention.proj.weight.data
+        if out_bias:
+            pit.out_proj.bias.data = attention.proj.bias.data
+        return pit
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
@@ -142,6 +157,19 @@ class PITMlp(nn.Module, PITModule):
         self.drop_1 = nn.Dropout(dropout)
         self.drop_2 = nn.Dropout(dropout)
 
+    @staticmethod
+    def from_timm(mlp: timm.layers.Mlp):
+        in_dim = mlp.fc1.weight.shape[1]
+        scale = mlp.fc1.weight.shape[0] // in_dim
+        has_bias = mlp.fc1.bias is not None
+        pit_mlp = PITMlp(in_dim, scale, mlp.drop1.p, bias=has_bias)
+        pit_mlp.fc_1.weight.data = mlp.fc1.weight.data
+        pit_mlp.fc_2.weight.data = mlp.fc2.weight.data
+        if has_bias:
+            pit_mlp.fc_1.bias.data = mlp.fc1.bias.data
+            pit_mlp.fc_2.bias.data = mlp.fc2.bias.data
+        return pit_mlp
+
     def forward(self, x):
         x = self.fc_1(x)
         x = self.activation(x)
@@ -211,6 +239,7 @@ class PITBlock(nn.Module, PITModule):
             qkv_bias=qkv_bias,
             out_bias=out_bias,
         )
+
         self.norm2 = norm_layer(dim)
         self.mlp = mlp_layer(
             dim,
@@ -218,17 +247,21 @@ class PITBlock(nn.Module, PITModule):
             proj_drop,
             bias=True,
         )
-        self.mlp.inpu_features_calculator = ModAttrFeaturesCalculator(self.attn, 'out_features_opt', 'features_mask')
+    @staticmethod
+    def from_timm(block: timm.models.vision_transformer.Block):
+        dim = block.attn.num_heads * block.attn.head_dim
+        pit_block = PITBlock(dim, block.attn.num_heads)
+        pit_block.attn = PITAttention.from_timm(block.attn)
+        pit_block.mlp = PITMlp.from_timm(block.mlp)
+        pit_block.norm1.load_state_dict(block.norm1.state_dict())
+        pit_block.norm2.load_state_dict(block.norm2.state_dict())
+        pit_block.norm1.eps = block.norm1.eps
+        pit_block.norm2.eps = block.norm2.eps
+        return pit_block
 
     def forward(self, x):
-        attn_out = self.attn.out_proj
-        theta_alpha = attn_out.out_features_masker.theta
-        attn_mask = PITBinarizer.apply(theta_alpha, attn_out._binarization_threshold)
-        mlp_out = self.mlp.fc_2
-        theta_alpha = mlp_out.out_features_masker.theta
-        mlp_mask = PITBinarizer.apply(theta_alpha, mlp_out._binarization_threshold)
-        x = torch.mul(x, attn_mask) + self.attn(self.norm1(x))
-        x = torch.mul(x, mlp_mask) + self.mlp(self.norm2(x))
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
         return x
 
     @property
@@ -250,7 +283,7 @@ class PITBlock(nn.Module, PITModule):
     @input_features_calculator.setter
     def input_features_calculator(self, calc: FeaturesCalculator):
         self.attn.input_features_calculator = calc
-        self.mlp.input_features_calculator = ModAttrFeaturesCalculator(self.attn, 'out_features_opt', 'features_mask')
+        self.mlp.input_features_calculator = calc
 
     def get_size(self) -> float:
         return self.attn.get_size() + self.mlp.get_size()
@@ -277,6 +310,17 @@ class PITPatchEmbedding(nn.Module, PITModule):
         self.patch_size = patch_size
         self.d_model = d_model
         self.conv = PITConv2d(nn.Conv2d(3, d_model, patch_size, stride=patch_size, bias=bias), image_size[0], image_size[1], PITFeaturesMasker(d_model))
+
+    @staticmethod
+    def from_timm(patch_embed: timm.layers.PatchEmbed, image_size):
+        patch_size = patch_embed.proj.kernel_size
+        hidden_dim = patch_embed.proj.weight.shape[0]
+        has_bias = patch_embed.proj.bias is not None
+        pit_embed = PITPatchEmbedding(image_size, patch_size, hidden_dim, bias = has_bias)
+        pit_embed.conv.weight.data = patch_embed.proj.weight.data
+        if has_bias:
+            pit_embed.conv.bias.data = patch_embed.proj.bias.data
+        return pit_embed
 
     def forward(self, x):
         return self.conv(x).flatten(2).transpose(1, 2)
@@ -338,13 +382,38 @@ class PITVIT(nn.Module, PITModule):
         nn.init.trunc_normal_(self.pos_embedding, std=0.2)
         self.embed_dropout = nn.Dropout(dropout)
         self.blocks = nn.Sequential(*[PITBlock(d_model, n_heads, mlp_ratio=ff_scale, proj_drop=dropout, qkv_bias=bias, out_bias=bias) for _ in range(n_layers)])
-        prev_features_calculator = ModAttrFeaturesCalculator(self.patch_embedding, 'out_features_opt', 'features_mask')
+        embed_features_calculator = ModAttrFeaturesCalculator(self.patch_embedding, 'out_features_opt', 'features_mask')
         for i in range(n_layers):
-            self.blocks[i].input_features_calculator = prev_features_calculator
-            prev_features_calculator = ModAttrFeaturesCalculator(self.blocks[i], 'out_features_opt', 'features_mask')
+            self.blocks[i].input_features_calculator = embed_features_calculator
         self.norm = nn.LayerNorm(d_model)
         self.head_dropout = nn.Dropout(dropout)
         self.head = nn.Linear(d_model, n_classes, bias = bias)
+
+    @staticmethod
+    def from_timm(vit: timm.models.vision_transformer.VisionTransformer, image_size):
+        n_layers = len(vit.blocks)
+        sample_block = vit.blocks[0]
+        n_heads = sample_block.attn.num_heads
+        d_model = n_heads * sample_block.attn.head_dim
+        ff_scale = sample_block.mlp.fc1.weight.shape[0] // d_model
+        dropout = sample_block.mlp.drop1.p
+        bias = sample_block.attn.qkv.bias is not None
+        n_classes = vit.head.out_features
+        patch_size = vit.patch_embed.proj.kernel_size
+        pit_vit = PITVIT(image_size, patch_size, n_layers, n_heads, d_model, ff_scale, dropout, n_classes, bias)
+        pit_vit.cls_token.data = vit.cls_token.data
+        pit_vit.pos_embedding.data = vit.pos_embed.data
+        pit_vit.patch_embedding = PITPatchEmbedding.from_timm(vit.patch_embed, image_size)
+        embed_features_calculator = ModAttrFeaturesCalculator(pit_vit.patch_embedding, 'out_features_opt', 'features_mask')
+        for i, block in enumerate(vit.blocks.children()):
+            pit_vit.blocks[i] = PITBlock.from_timm(block)
+            pit_vit.blocks[i].input_features_calculator = embed_features_calculator
+        pit_vit.norm.load_state_dict(vit.norm.state_dict())
+        pit_vit.norm.eps = vit.norm.eps
+        pit_vit.head.weight.data = vit.head.weight.data
+        if vit.head.bias is not None:
+            pit_vit.head.bias.data = vit.head.bias.data
+        return pit_vit
     
     def _pos_embed(self, x):
         x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)

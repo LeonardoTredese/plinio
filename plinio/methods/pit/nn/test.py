@@ -137,12 +137,14 @@ class Block(nn.Module):
         x = x + self.mlp(self.norm2(x))
         return x
 
+### Tests ###
+
 def test_copy_timm_attention():
     model = timm.create_model('vit_tiny_patch16_384', pretrained=True)
     for i, block in enumerate(model.blocks.children()):
         attention = block.attn
         hidden_dim = attention.num_heads * attention.head_dim
-        pit_attention = attention_to_pit(attention)
+        pit_attention = PITAttention.from_timm(attention)
         attention.eval()
         pit_attention.eval()
         x = torch.randn(1, (384 // 16) ** 2  + 1, hidden_dim)
@@ -152,7 +154,7 @@ def test_copy_timm_mlp():
     model = timm.create_model('vit_tiny_patch16_384', pretrained=True)
     for i, block in enumerate(model.blocks.children()):
         mlp = block.mlp
-        pit_mlp = mlp_to_pit(mlp)
+        pit_mlp = PITMlp.from_timm(mlp)
         in_dim = mlp.fc1.weight.shape[1]
         x = torch.randn(1, (384 // 16) ** 2  + 1, in_dim)
         mlp.eval()
@@ -162,7 +164,7 @@ def test_copy_timm_mlp():
 def test_copy_timm_block():
     model = timm.create_model('vit_tiny_patch16_384', pretrained=True)
     for i, block in enumerate(model.blocks.children()):
-        pit_block = block_to_pit(block)
+        pit_block = PITBlock.from_timm(block)
         in_dim = block.mlp.fc1.weight.shape[1]
         x = torch.randn(1, (384 // 16) ** 2  + 1, in_dim)
         block.eval()
@@ -171,90 +173,16 @@ def test_copy_timm_block():
 
 def test_copy_timm_embed():
     model = timm.create_model('vit_tiny_patch16_384', pretrained=True)
-    pit_embed = embed_to_pit(model.patch_embed, (384,) * 2)
+    pit_embed = PITPatchEmbedding.from_timm(model.patch_embed, (384,) * 2)
     x = torch.randn(1, 3, 384, 384)
     pit_embed.eval()
     model.patch_embed.eval()
     assert torch.allclose(pit_embed(x), model.patch_embed(x)), "Patch embedding failed"
 
-def block_to_pit(block: Block) -> PITBlock:
-    dim = block.attn.num_heads * block.attn.head_dim
-    pit_block = PITBlock(dim, block.attn.num_heads)
-    pit_block.attn = attention_to_pit(block.attn)
-    pit_block.mlp = mlp_to_pit(block.mlp)
-    pit_block.norm1.load_state_dict(block.norm1.state_dict())
-    pit_block.norm2.load_state_dict(block.norm2.state_dict())
-    pit_block.norm1.eps = block.norm1.eps
-    pit_block.norm2.eps = block.norm2.eps
-    return pit_block
-
-def mlp_to_pit(mlp: Mlp) -> PITModule:
-    in_dim = mlp.fc1.weight.shape[1]
-    scale = mlp.fc1.weight.shape[0] // in_dim
-    has_bias = mlp.fc1.bias is not None
-    pit_mlp = PITMlp(in_dim, scale, mlp.drop1.p, bias=has_bias)
-    pit_mlp.fc_1.weight.data = mlp.fc1.weight.data
-    pit_mlp.fc_2.weight.data = mlp.fc2.weight.data
-    if has_bias:
-        pit_mlp.fc_1.bias.data = mlp.fc1.bias.data
-        pit_mlp.fc_2.bias.data = mlp.fc2.bias.data
-    return pit_mlp
-
-def attention_to_pit(attention: Attention) -> PITAttention:
-    hidden_dim = attention.num_heads * attention.head_dim
-    qkv_bias = attention.qkv.bias is not None
-    out_bias = attention.proj.bias is not None
-    fused_attn = attention.fused_attn
-    pit = PITAttention(hidden_dim, attention.num_heads, qkv_bias=qkv_bias, out_bias=out_bias, fused_attention=fused_attn)
-    pit.q_proj.weight.data, pit.k_proj.weight.data, pit.v_proj.weight.data= attention.qkv.weight.data.chunk(3)
-    if qkv_bias:
-        pit.q_proj.bias.data, pit.k_proj.bias.data, pit.v_proj.bias.data= attention.qkv.bias.data.chunk(3)
-    pit.out_proj.weight.data = attention.proj.weight.data
-    if out_bias:
-        pit.out_proj.bias.data = attention.proj.bias.data
-    return pit
-
-def embed_to_pit(patch_embed, image_dimension):
-    patch_size = patch_embed.proj.kernel_size
-    hidden_dim = patch_embed.proj.weight.shape[0]
-    has_bias = patch_embed.proj.bias is not None
-    pit_embed = PITPatchEmbedding(image_dimension, patch_size, hidden_dim, bias = has_bias)
-    pit_embed.conv.weight.data = patch_embed.proj.weight.data
-    if has_bias:
-        pit_embed.conv.bias.data = patch_embed.proj.bias.data
-    return pit_embed
-
-def vit_to_pit(vit, image_size):
-    n_layers = len(vit.blocks)
-    sample_block = vit.blocks[0]
-    n_heads = sample_block.attn.num_heads
-    d_model = n_heads * sample_block.attn.head_dim
-    ff_scale = sample_block.mlp.fc1.weight.shape[0] // d_model
-    dropout = sample_block.mlp.drop1.p
-    bias = sample_block.attn.qkv.bias is not None
-    n_classes = vit.head.out_features
-    patch_size = vit.patch_embed.proj.kernel_size
-    pit_vit = PITVIT(image_size, patch_size, n_layers, n_heads, d_model, ff_scale, dropout, n_classes, bias)
-    pit_vit.cls_token.data = vit.cls_token.data
-    pit_vit.pos_embedding.data = vit.pos_embed.data
-    pit_vit.patch_embedding = embed_to_pit(vit.patch_embed, image_size)
-    prev_features_calculator = ModAttrFeaturesCalculator(pit_vit.patch_embedding, 'out_features_opt', 'features_mask')
-    for i, block in enumerate(vit.blocks.children()):
-        pit_vit.blocks[i] = block_to_pit(block)
-        pit_vit.blocks[i].input_features_calculator = prev_features_calculator
-        prev_features_calculator = ModAttrFeaturesCalculator(pit_vit.blocks[i], 'out_features_opt', 'features_mask')
-    pit_vit.norm.load_state_dict(vit.norm.state_dict())
-    pit_vit.norm.eps = vit.norm.eps
-    pit_vit.head.weight.data = vit.head.weight.data
-    if vit.head.bias is not None:
-        pit_vit.head.bias.data = vit.head.bias.data
-    return pit_vit
-
-### Tests ###
 
 def test_vit_to_pit():
     model = timm.create_model('vit_tiny_patch16_384', pretrained=True)
-    pit_model = vit_to_pit(model, (384,) * 2)
+    pit_model = PITVIT.from_timm(model, (384,)*2)
     x = torch.randn(1, 3, 384, 384)
     x_tokens = torch.ones(1, (384 // 16) ** 2 + 1, 192)
     x_pre_tokens = torch.ones(1, (384 // 16) ** 2, 192)
@@ -279,7 +207,7 @@ def test_attention_to_pit():
     batch_size = 1
 
     attention = Attention(hidden_dim, n_heads)
-    pit_attention = attention_to_pit(attention)
+    pit_attention = PITAttention.from_timm(attention)
 
     attention.eval()
     pit_attention.eval()
