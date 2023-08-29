@@ -260,8 +260,14 @@ class PITBlock(nn.Module, PITModule):
         return pit_block
 
     def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
+        attn_out = self.attn.out_proj
+        theta_alpha = attn_out.out_features_masker.theta
+        attn_mask = PITBinarizer.apply(theta_alpha, attn_out._binarization_threshold)
+        mlp_out = self.mlp.fc_2
+        theta_alpha = mlp_out.out_features_masker.theta
+        mlp_mask = PITBinarizer.apply(theta_alpha, mlp_out._binarization_threshold)
+        x = torch.mul(x, attn_mask) + self.attn(self.norm1(x))
+        x = torch.mul(x, mlp_mask) + self.mlp(self.norm2(x))
         return x
 
     @property
@@ -382,12 +388,10 @@ class PITVIT(nn.Module, PITModule):
         nn.init.trunc_normal_(self.pos_embedding, std=0.2)
         self.embed_dropout = nn.Dropout(dropout)
         self.blocks = nn.Sequential(*[PITBlock(d_model, n_heads, mlp_ratio=ff_scale, proj_drop=dropout, qkv_bias=bias, out_bias=bias) for _ in range(n_layers)])
-        embed_features_calculator = ModAttrFeaturesCalculator(self.patch_embedding, 'out_features_opt', 'features_mask')
-        for i in range(n_layers):
-            self.blocks[i].input_features_calculator = embed_features_calculator
         self.norm = nn.LayerNorm(d_model)
         self.head_dropout = nn.Dropout(dropout)
         self.head = nn.Linear(d_model, n_classes, bias = bias)
+        self.cascade_wiring()
 
     @staticmethod
     def from_timm(vit: timm.models.vision_transformer.VisionTransformer, image_size):
@@ -407,17 +411,51 @@ class PITVIT(nn.Module, PITModule):
         embed_features_calculator = ModAttrFeaturesCalculator(pit_vit.patch_embedding, 'out_features_opt', 'features_mask')
         for i, block in enumerate(vit.blocks.children()):
             pit_vit.blocks[i] = PITBlock.from_timm(block)
-            pit_vit.blocks[i].input_features_calculator = embed_features_calculator
         pit_vit.norm.load_state_dict(vit.norm.state_dict())
         pit_vit.norm.eps = vit.norm.eps
         pit_vit.head.weight.data = vit.head.weight.data
         if vit.head.bias is not None:
             pit_vit.head.bias.data = vit.head.bias.data
         return pit_vit
-    
+
+    def cascade_wiring(self):
+        prev_features_calculator = ModAttrFeaturesCalculator(self.patch_embedding, 'out_features_opt', 'features_mask')
+        for block in self.blocks.children():
+            block.input_features_calculator = prev_features_calculator
+            in_features_calculator = ModAttrFeaturesCalculator(block, 'out_features_opt', 'features_mask')
+
+    def hidden_dim_wiring(self):
+        hidden_dim_masker = PITFeaturesMasker(self.d_model)
+        self.patch_embedding.conv.out_features_masker = hidden_dim_masker
+        in_features_calculator = ModAttrFeaturesCalculator(self.patch_embedding, 'out_features_opt', 'features_mask')
+        for block in self.blocks.children():
+            block.input_features_calculator = in_features_calculator
+            block.attn.out_proj.out_features_masker = hidden_dim_masker
+            block.mlp.fc_2.out_features_masker = hidden_dim_masker
+
+    def shared_mask_wiring(self):
+        hidden_dim_masker = PITFeaturesMasker(self.d_model)
+        qk_masker = PITFeaturesMasker(self.d_model)
+        v_masker = PITFeaturesMasker(self.d_model)
+        fc1_masker = PITFeaturesMasker(self.d_model * self.ff_scale)
+        self.patch_embedding.conv.out_features_masker = hidden_dim_masker
+        in_features_calculator = ModAttrFeaturesCalculator(self.patch_embedding, 'out_features_opt', 'features_mask')
+        for block in self.blocks.children():
+            block.input_features_calculator = in_features_calculator
+            block.attn.out_proj.out_features_masker = hidden_dim_masker
+            block.attn.q_proj.out_features_masker = qk_masker
+            block.attn.k_proj.out_features_masker = qk_masker
+            block.attn.v_proj.out_features_masker = v_masker
+            block.mlp.fc_1.out_features_masker = fc1_masker
+            block.mlp.fc_2.out_features_masker = hidden_dim_masker
+
     def _pos_embed(self, x):
-        x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
-        return x + self.pos_embedding
+        embed_conv = self.patch_embedding.conv
+        theta_alpha = embed_conv.out_features_masker.theta
+        embed_mask = PITBinarizer.apply(theta_alpha, embed_conv._binarization_threshold)
+        masked_cls_token = torch.mul(self.cls_token, embed_mask)
+        x = torch.cat((masked_cls_token.expand(x.shape[0], -1, -1), x), dim=1)
+        return x + torch.mul(self.pos_embedding, embed_mask)
 
     def forward_features(self, x):
         x = self.patch_embedding(x)

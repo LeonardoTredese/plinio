@@ -269,6 +269,29 @@ def test_qk_same_mask():
         assert torch.all(q_hat[..., mask] == 0), f"masked q_hat should be zeros insetad of {q_hat[..., mask]}"
         assert torch.all(k_hat[..., mask] == 0), f"masked k_hat should be zeros insetad of {k_hat[..., mask]}"
 
+def test_hiddendim_embed_features_mask():
+    image_size = 384
+    patch_size = 16
+    n_layers = 12
+    n_heads = 12
+    d_model = 384
+    ff_scale = 4
+    dropout = 0.1
+    n_classes = 4
+    bias = True
+
+    x = torch.randn(1, 3, image_size, image_size)
+
+    model = PITVIT(image_size, patch_size, n_layers, n_heads, d_model, ff_scale, dropout, n_classes, bias)
+    model.hidden_dim_wiring()
+    random_mask = nn.Parameter(torch.randint(0, 2, (d_model,), dtype=torch.float32))
+    model.patch_embedding.conv.out_features_masker.alpha = random_mask
+    mask = model.patch_embedding.conv.features_mask == 0
+    x = model.patch_embedding(x)
+    assert torch.all(x[..., mask] == 0), f"masked patch embedding should be zeros insetad of {x[..., mask]}"
+    x = model._pos_embed(x)
+    assert torch.all(x[..., mask] == 0), f"masked pos_embed should be zeros insetad of {model._pos_embed[..., mask]}"
+
 def test_weight_gradient():
     hidden_dim = 384
     n_heads = 12
@@ -290,7 +313,8 @@ def test_weight_gradient():
 def test_nas_gradient():
     x = torch.randn(1, 3, 384, 384)
     model = timm.create_model('vit_tiny_patch16_384', pretrained=True, num_classes=10)
-    pit_model = vit_to_pit(model, x.shape[-2:])
+    pit_model = PITVIT.from_timm(model, x.shape[-2:])
+    pit_model.cascade_wiring()
     pit_model(x)
     loss = pit_model.get_size()
     loss.backward()
@@ -303,6 +327,7 @@ def test_nas_gradient():
             assert param.grad is None or torch.all(param.grad == 0), f"param {name} aren't all zeros gradient" 
 
 def main():
+    test_hiddendim_embed_features_mask()
     test_nas_gradient()
     test_qk_same_mask()
     test_weight_gradient()

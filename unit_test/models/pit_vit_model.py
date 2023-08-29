@@ -49,7 +49,9 @@ dataloaders = icl.build_dataloaders(datasets, batch_size=config['batch_size'], n
 train_dl, val_dl, test_dl = dataloaders
 
 base_model = timm.create_model(config['base_model'], pretrained=True, num_classes=10)
-model = PITVIT.from_timm(base_model, (image_size,) * 2).to(device)
+model = PITVIT.from_timm(base_model, (image_size,) * 2)
+model.shared_mask_wiring()
+model = model.to(device)
 
 nas_names, nas_parameters = zip(*model.named_nas_parameters())
 parameters = list(map(lambda x: x[1], filter(lambda x: x[0] not in nas_names, model.named_parameters())))
