@@ -27,22 +27,20 @@ class PITAttention(nn.Module, PITModule):
         self.scale_factor = self.head_dim ** -.5
         self.binarization_threshold = binarization_threshold
         self.n_heads = n_heads
-        self.qk_features_masker = PITFeaturesMasker(self.hidden_dim)
-        self.v_features_masker = PITFeaturesMasker(self.hidden_dim)
+        self.qk_features_masker = PITFeaturesMasker(self.head_dim)
+        self.v_features_masker = PITFeaturesMasker(self.head_dim)
         self.output_features_masker = PITFeaturesMasker(self.hidden_dim)
+        self.heads_features_masker = PITFeaturesMasker(n_heads)
         self.fused_attention = fused_attention
-        
-        self.q_proj = PITLinear(nn.Linear(hidden_dim, hidden_dim, bias=qkv_bias), \
-                                self.qk_features_masker, binarization_threshold=binarization_threshold)
-        self.k_proj = PITLinear(nn.Linear(hidden_dim, hidden_dim, bias=qkv_bias), \
-                                self.qk_features_masker, binarization_threshold=binarization_threshold)
-        self.v_proj = PITLinear(nn.Linear(hidden_dim, hidden_dim, bias=qkv_bias), \
-                                self.v_features_masker, binarization_threshold=binarization_threshold)
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=qkv_bias)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=qkv_bias)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim, bias=qkv_bias) 
         self.out_proj = PITLinear(nn.Linear(hidden_dim, hidden_dim, bias=out_bias), \
                                   self.output_features_masker, binarization_threshold=binarization_threshold)
         self.input_features_calculator = ConstFeaturesCalculator(hidden_dim)
         v_proj_calculator = ModAttrFeaturesCalculator(self.v_proj, 'out_features_opt', 'features_mask')
         self.out_proj.input_features_calculator = v_proj_calculator
+        self.register_buffer('heads_eff', torch.tensor(self.n_heads, dtype=torch.float32))
 
     @staticmethod  
     def from_timm(attention: timm.models.vision_transformer.Attention):
@@ -60,14 +58,24 @@ class PITAttention(nn.Module, PITModule):
         return pit
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        heads_masks = self._feature_mask(self.heads_features_masker, discrete=True)
+        qk_head_mask = self._feature_mask(self.qk_features_masker, discrete=True)
+        v_head_mask = self._feature_mask(self.v_features_masker, discrete=True) 
+        qk_mask = (heads_masks.unsqueeze(1) * qk_head_mask.unsqueeze(0)).flatten()
+        v_mask = (heads_masks.unsqueeze(1) * v_head_mask.unsqueeze(0)).flatten()
+
         B, N, C = x.shape
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+        q_pruned = torch.mul(self.q_proj.weight, qk_mask.unsqueeze(1))
+        q = nn.functional.linear(x, q_pruned, self.q_proj.bias)
+        k_pruned = torch.mul(self.k_proj.weight, qk_mask.unsqueeze(1))
+        k = nn.functional.linear(x, k_pruned, self.k_proj.bias)
+        v_pruned = torch.mul(self.v_proj.weight, v_mask.unsqueeze(1))
+        v = nn.functional.linear(x, v_pruned, self.v_proj.bias)
+
         q = q.reshape(*q.shape[:-1], self.n_heads, self.head_dim).transpose(-2, -3)
         k = k.reshape(*k.shape[:-1], self.n_heads, self.head_dim).transpose(-2, -3)
         v = v.reshape(*v.shape[:-1], self.n_heads, self.head_dim).transpose(-2, -3)
-       
+
         if self.fused_attention:
             x = F.scaled_dot_product_attention(q, k, v) 
         else:
@@ -87,11 +95,21 @@ class PITAttention(nn.Module, PITModule):
     def in_features_opt(self) -> int:
         with torch.no_grad():
             return int(torch.sum(self.input_features_calculator.features_mask))
-    
+   
+    def _feature_mask(self, masker: PITFeaturesMasker, discrete: bool) -> torch.Tensor:
+        theta_alpha = masker.theta
+        if discrete:
+            theta_alpha = PITBinarizer.apply(theta_alpha, self.binarization_threshold)
+        return cast(torch.Tensor, theta_alpha)
+
     def __feature_mask(self, masker: PITFeaturesMasker) -> torch.Tensor:
         with torch.no_grad():
             theta_alpha = masker.theta
             return PITBinarizer.apply(theta_alpha, self.binarization_threshold)
+    
+    @property
+    def heads_mask(self) -> torch.Tensor:
+        return self.__feature_mask(self.heads_features_masker)
 
     @property
     def features_mask(self) -> torch.Tensor:
@@ -106,10 +124,18 @@ class PITAttention(nn.Module, PITModule):
         return self.__feature_mask(self.v_features_masker)
 
     def get_size(self) -> float:
-        return self.q_proj.get_size() + self.k_proj.get_size() + self.v_proj.get_size() + self.out_proj.get_size()
+        in_features = self.input_features_calculator.features
+        heads_eff = torch.sum(self.heads_features_masker.theta)
+        qk_eff = torch.sum(self.qk_features_masker.theta)
+        v_eff = torch.sum(self.v_features_masker.theta)
+        return in_features * heads_eff * (2 * qk_eff + v_eff) + heads_eff * v_eff * self.out_proj.out_features_eff
 
     def get_size_binarized(self) -> int:
-        return self.q_proj.get_size_binarized() + self.k_proj.get_size_binarized() + self.v_proj.get_size_binarized() + self.out_proj.get_size_binarized()
+        in_features = torch.sum(self.input_features_calculator.features_mask)
+        heads = torch.sum(self.__feature_mask(self.heads_features_masker))
+        qk = torch.sum(self.__feature_mask(self.qk_features_masker))
+        v = torch.sum(self.__feature_mask(self.v_features_masker))
+        return in_features * heads * (2 * qk + v) + heads * v * self.out_features_opt
     
     # TODO: implement
     def get_macs(self) -> int:
@@ -122,9 +148,6 @@ class PITAttention(nn.Module, PITModule):
     @input_features_calculator.setter
     def input_features_calculator(self, input_features_calculator: FeaturesCalculator) -> None:
         self._input_features_calculator = input_features_calculator
-        self.q_proj.input_features_calculator = input_features_calculator
-        self.k_proj.input_features_calculator = input_features_calculator
-        self.v_proj.input_features_calculator = input_features_calculator
 
     def summary(self) -> Dict[str, Any]:
         return { 'in_features': self.in_features_opt, 'out_features': self.out_features_opt, 'qk_features': int(torch.sum(self.qk_features_mask)), 'v_features': int(torch.sum(self.v_features_mask)) }
@@ -137,6 +160,8 @@ class PITAttention(nn.Module, PITModule):
         for name, param in self.v_features_masker.named_parameters(prefix=prefix+'v_features_masker', recurse=recurse):
             yield name, param
         for name, param in self.output_features_masker.named_parameters(prefix=prefix+'output_features_masker', recurse=recurse):
+            yield name, param
+        for name, param in self.heads_features_masker.named_parameters(prefix=prefix+'heads_features_masker', recurse=recurse):
             yield name, param
 
     def nas_parameters(self, recurse: bool = False) -> Iterator[nn.Parameter]:
@@ -434,18 +459,20 @@ class PITVIT(nn.Module, PITModule):
             block.mlp.fc_2.out_features_masker = hidden_dim_masker
 
     def shared_mask_wiring(self):
+        head_dim = self.d_model // self.n_heads
         hidden_dim_masker = PITFeaturesMasker(self.d_model)
-        qk_masker = PITFeaturesMasker(self.d_model)
-        v_masker = PITFeaturesMasker(self.d_model)
+        qk_masker = PITFeaturesMasker(head_dim)
+        v_masker = PITFeaturesMasker(head_dim)
+        heads_features_masker = PITFeaturesMasker(self.n_heads)
         fc1_masker = PITFeaturesMasker(self.d_model * self.ff_scale)
         self.patch_embedding.conv.out_features_masker = hidden_dim_masker
         in_features_calculator = ModAttrFeaturesCalculator(self.patch_embedding, 'out_features_opt', 'features_mask')
         for block in self.blocks.children():
             block.input_features_calculator = in_features_calculator
             block.attn.out_proj.out_features_masker = hidden_dim_masker
-            block.attn.q_proj.out_features_masker = qk_masker
-            block.attn.k_proj.out_features_masker = qk_masker
-            block.attn.v_proj.out_features_masker = v_masker
+            block.attn.qk_features_masker = qk_masker
+            block.attn.v_features_masker = v_masker
+            block.attn.heads_features_masker = heads_features_masker
             block.mlp.fc_1.out_features_masker = fc1_masker
             block.mlp.fc_2.out_features_masker = hidden_dim_masker
 

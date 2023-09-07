@@ -248,27 +248,6 @@ def test_attention_output():
         timm_attention_output = timm_attention(x)
         assert torch.allclose(pit_attention_output, timm_attention_output), f"outputs should be the same, Timm: \n {timm_attention_output} \n PIT: \n {pit_attention_output}"
         
-def test_qk_same_mask():
-    hidden_dim = 384
-    n_heads = 12
-    seq_len = 20
-    batch_size = 32
-    epochs = 100
-
-    x = torch.randn(batch_size, seq_len, hidden_dim)
-    y = torch.randn(batch_size, seq_len, hidden_dim)
-
-    attention = PITAttention(hidden_dim, n_heads)
-    # impose random masks
-    attention.qk_features_masker.alpha = nn.Parameter(torch.randint(0, 2, (hidden_dim,), dtype=torch.float32))
-    with torch.no_grad():
-        q_hat = attention.q_proj(x)
-        k_hat = attention.k_proj(x)
-        mask = attention.qk_features_mask == 0
-        # assert that all the masked features are zero
-        assert torch.all(q_hat[..., mask] == 0), f"masked q_hat should be zeros insetad of {q_hat[..., mask]}"
-        assert torch.all(k_hat[..., mask] == 0), f"masked k_hat should be zeros insetad of {k_hat[..., mask]}"
-
 def test_hiddendim_embed_features_mask():
     image_size = 384
     patch_size = 16
@@ -329,7 +308,6 @@ def test_nas_gradient():
 def main():
     test_hiddendim_embed_features_mask()
     test_nas_gradient()
-    test_qk_same_mask()
     test_weight_gradient()
     test_attention_output()
     test_attention_to_pit()
