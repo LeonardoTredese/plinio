@@ -108,7 +108,7 @@ class PITAttention(nn.Module, PITModule):
             return PITBinarizer.apply(theta_alpha, self.binarization_threshold)
     
     @property
-    def heads_mask(self) -> torch.Tensor:
+    def heads_features_mask(self) -> torch.Tensor:
         return self.__feature_mask(self.heads_features_masker)
 
     @property
