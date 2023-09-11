@@ -79,6 +79,7 @@ class PITAttention(nn.Module, PITModule):
         if self.fused_attention:
             x = F.scaled_dot_product_attention(q, k, v) 
         else:
+            self.scale_factor = torch.sum(qk_head_mask) ** -.5
             q = q * self.scale_factor
             attention = q @ k.transpose(-2, -1)
             attention = torch.softmax(attention, dim=-1)
@@ -392,6 +393,7 @@ class PITPatchEmbedding(nn.Module, PITModule):
     def nas_parameters(self, recurse: bool = False) -> Iterator[nn.Parameter]:
         for _, param in self.named_nas_parameters(recurse=recurse):
             yield param
+
 
 class PITVIT(nn.Module, PITModule):
     def __init__(self, image_size, patch_size, n_layers, n_heads, d_model, ff_scale, dropout, n_classes, bias):
