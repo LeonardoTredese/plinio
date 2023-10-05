@@ -92,9 +92,10 @@ class PITConv2d(nn.Conv2d, PITModule):
         theta_alpha = self.out_features_masker.theta
         bin_theta_alpha = PITBinarizer.apply(theta_alpha, self._binarization_threshold)
         pruned_weight = torch.mul(self.weight, bin_theta_alpha.view(-1, 1, 1, 1))
+        pruned_bias = torch.mul(self.bias, bin_theta_alpha) if self.bias is not None else None
 
         # conv operation
-        y = self._conv_forward(input, pruned_weight, self.bias)
+        y = self._conv_forward(input, pruned_weight, pruned_bias)
 
         # save info for regularization
         self.out_features_eff = torch.sum(theta_alpha)
@@ -265,7 +266,7 @@ class PITConv2d(nn.Conv2d, PITModule):
         :rtype: torch.Tensor
         """
         cin = self.input_features_calculator.features
-        cost = cin * self.out_features_eff * self.kernel_size[0] * self.kernel_size[1]
+        cost = (cin  * self.kernel_size[0] * self.kernel_size[1] + int(self.bias is not None)) * self.out_features_eff
         if self.groups > 1:
             cost = cost / self.out_features_eff
         return cost
@@ -284,7 +285,7 @@ class PITConv2d(nn.Conv2d, PITModule):
         cout_mask = self.out_features_masker.theta
         cout = torch.sum(PITBinarizer.apply(cout_mask, self._binarization_threshold))
         # Finally compute cost
-        cost = cin * cout * self.kernel_size[0] * self.kernel_size[1]
+        cost = (cin * self.kernel_size[0] * self.kernel_size[1] + 1) * cout
         if self.groups > 1:
             cost = cost / cout
         return cost

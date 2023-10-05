@@ -77,9 +77,10 @@ class PITLinear(nn.Linear, PITModule):
         # TODO: check that the result is correct after removing the two transposes present in
         # Matteo's original version
         pruned_weight = torch.mul(self.weight, bin_alpha.unsqueeze(1))
+        pruned_bias = torch.mul(self.bias, bin_alpha) if self.bias is not None else None
 
         # linear operation
-        y = F.linear(input, pruned_weight, self.bias)
+        y = F.linear(input, pruned_weight, pruned_bias)
 
         # save info for regularization
         self.out_features_eff = torch.sum(theta_alpha)
@@ -229,7 +230,7 @@ class PITLinear(nn.Linear, PITModule):
         :rtype: torch.Tensor
         """
         cin = self.input_features_calculator.features
-        cost = cin * self.out_features_eff
+        cost = (cin + int(self.bias is not None)) * self.out_features_eff
         return cost
 
     def get_size_binarized(self) -> torch.Tensor:
@@ -246,7 +247,7 @@ class PITLinear(nn.Linear, PITModule):
         cout_mask = self.out_features_masker.theta
         cout = torch.sum(PITBinarizer.apply(cout_mask, self._binarization_threshold))
         # Finally compute cost
-        cost = cin * cout
+        cost = (cin + int(self.bias is not None)) * cout
         return cost
 
     def get_macs(self) -> torch.Tensor:
