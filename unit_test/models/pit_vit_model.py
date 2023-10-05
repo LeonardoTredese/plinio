@@ -3,7 +3,7 @@ import torch.nn as nn
 import plinio.methods.pit.nn as pnn
 from plinio.methods.pit.nn.features_masker import PITFeaturesMasker
 from plinio.graph.features_calculation import ModAttrFeaturesCalculator, FeaturesCalculator
-from plinio.methods.pit.nn import PITConv2d, PITLinear, PITVIT
+from plinio.methods.pit.nn import PITConv2d, PITLinear, PITVIT, PITAttention
 import torchvision
 import torch.optim as optim
 import torchvision.transforms as transforms
@@ -18,47 +18,80 @@ from pytorch_benchmarks.utils import seed_all, EarlyStopping
 import os
 from tqdm import tqdm
 import wandb
+from collections import Counter
 
 # train the model on cifar10
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+device = 'cuda:3'
 
 # ensure deterministic behavior
 seed = seed_all(seed=42)
 
+#checkpoint
+
+checkpoint = 'peach-fog-231_checkpoint_110.pt'
+
 # configuration
 config = {
-    'base_model': 'vit_tiny_patch16_384',
-    'dataset': 'cifar10',
-    'batch_size': 128,
+    'base_model': 'vit_small_patch16_384',
+    'dataset': 'tiny-imagenet',
+    'batch_size': 100,
     'learning_rate': 1e-4,
     'nas_learning_rate': 1e-2,
     'weight_decay': 5e-2,
     'epochs': 500,
-    'size_lambda': 1e-7,
+    'size_lambda': 1e-8,
     'weight_update_frequency': 10,
     'image_size': 384,
     'patch_size': 16,
+    'wiring': 'hidden',
     'checkpoint_frequency': 10,
+    'keep_heads': True
 }
-
-# cifar10 stardard meand and deviation
 image_size = config['image_size']
 patch_size = config['patch_size']
-datasets = icl.get_data(dataset=config['dataset'], download=True, image_size=(image_size, image_size))
+datasets = icl.get_data(dataset=config['dataset'], download=True, image_size=(image_size, image_size), data_dir='~/.cache')
 dataloaders = icl.build_dataloaders(datasets, batch_size=config['batch_size'], num_workers=os.cpu_count(), seed=seed)
 train_dl, val_dl, test_dl = dataloaders
-
-base_model = timm.create_model(config['base_model'], pretrained=True, num_classes=10)
+base_model = timm.create_model(config['base_model'], pretrained=True, num_classes=200)
 model = PITVIT.from_timm(base_model, (image_size,) * 2)
-model.shared_mask_wiring()
+if checkpoint:
+    ck = torch.load(checkpoint)
+    model.load_state_dict(ck['model_state_dict'])
+    config = ck['config']
+
+if config['wiring'] == 'shared':
+    model.shared_mask_wiring()
+elif config['wiring'] == 'hidden':
+    model.hidden_dim_wiring()
+elif config['wiring'] == 'unshared':
+    model.unshared_wiring()
+
+if config['keep_heads']:
+    model.keep_heads()
+model.fused_attention = False
 model = model.to(device)
 
 nas_names, nas_parameters = zip(*model.named_nas_parameters())
 parameters = list(map(lambda x: x[1], filter(lambda x: x[0] not in nas_names, model.named_parameters())))
-optimizer = optim.AdamW([{'params': parameters, 'lr': config['learning_rate'], 'weight_decay': config['weight_decay']},
-                         {'params': nas_parameters, 'lr': config['nas_learning_rate'], 'weight_decay': 0}])
+
+id_nas_param = dict((id(p), p) for p in nas_parameters)
+scale_nas_parameters = Counter(map(id, nas_parameters))
+scaled_nas_param_groups =[
+    {'params': p, 'lr': config['nas_learning_rate'] * (1 - scale_nas_parameters[i] / scale_nas_parameters.total()) , 'weight_decay': 0}
+    for i, p in id_nas_param.items()
+]
+
+
+optimizer = optim.AdamW([{'params': parameters, 'lr': config['learning_rate'], 'weight_decay': config['weight_decay']}] + scaled_nas_param_groups)
 scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=4, T_mult=1, eta_min=1e-8)
 criterion = SoftTargetCrossEntropy()
+init_epoch = 0
+
+if checkpoint:
+    optimizer.load_state_dict(ck['optimizer_state_dict'])
+    scheduler.load_state_dict(ck['scheduler'])
+    init_epoch = ck['epoch'] + 1
+
 
 def evaluate(model, data_loader):
     model.eval()
@@ -88,7 +121,7 @@ def train(train_loader, model, optimizer, scheduler, criterion, size_lambda, fre
         data = random_erasing(data)
         with torch.cuda.amp.autocast():
             output = model(data)
-            loss = criterion(output, target) + size_lambda * model.get_size()
+            loss = (criterion(output, target) + size_lambda * model.get_size())
         scaler.scale(loss).backward()
         # gradient accumulation
         if (batch_idx + 1) % frequency == 0 or batch_idx == len(train_loader) - 1:
@@ -110,28 +143,28 @@ def checkpoint(model, optimizer, scheduler, name, epoch, config):
     }, f"{name}_checkpoint_{epoch}.pt")
 
 # initialize wandb
-accuracy_stop = EarlyStopping(mode='max', patience=10)
-size_stop = EarlyStopping(mode='min', patience=10)
+accuracy_stop = EarlyStopping(mode='max', patience=20)
+size_stop = EarlyStopping(mode='min', patience=20)
 run = wandb.init(project='pit-vit', config=config)
-wandb.watch(model)
 
-for epoch in range(config['epochs']):
+for epoch in range(init_epoch, config['epochs']):
     print(f"Epoch {epoch}")
     train(train_dl, model, optimizer, scheduler, criterion, size_lambda=config['size_lambda'], frequency=config['weight_update_frequency'])
-    train_loss, train_accuracy, _, = evaluate(model, train_dl)
-    print(f"TRAIN loss: {train_loss}, accuracy: {train_accuracy}")
     val_loss, val_accuracy, _ = evaluate(model, val_dl)
     print(f"VAL loss: {val_loss}, accuracy: {val_accuracy}")
     test_loss, test_accuracy, model_size = evaluate(model, test_dl)
     print(f"TEST loss: {test_loss}, accuracy: {test_accuracy}, model size: {model_size}")
-    metrics = {'train_loss': train_loss, 'train_accuracy': train_accuracy,\
-               'val_loss': val_loss, 'val_accuracy': val_accuracy, \
+    metrics = {'val_loss': val_loss, 'val_accuracy': val_accuracy, \
                'test_loss': test_loss, 'test_accuracy': test_accuracy, \
                'model_size': model_size}
     layers_params = dict()
     for name, param in model.named_modules():
         if isinstance(param, PITConv2d) or isinstance(param, PITLinear):
             layers_params[f"{name}"] = param.out_features_opt
+        if isinstance(param, PITAttention):
+            layers_params[f"{name}_heads"] = param.heads_features_opt
+            layers_params[f"{name}_qk"] = param.qk_features_opt
+            layers_params[f"{name}_v"] = param.v_features_opt
     wandb.log(add_prefix("metrics/", metrics) | add_prefix("layers_masks/", layers_params))
     if epoch and epoch % config['checkpoint_frequency'] == 0:
         checkpoint(model, optimizer, scheduler, run.name, epoch, config)

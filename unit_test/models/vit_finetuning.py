@@ -1,9 +1,8 @@
 import torch
 import torch.nn as nn
 import plinio.methods.pit.nn as pnn
-from plinio.methods.pit.nn.features_masker import PITFeaturesMasker
-from plinio.graph.features_calculation import ModAttrFeaturesCalculator, FeaturesCalculator
-from plinio.methods.pit.nn import PITConv2d, PITLinear, PITVIT
+from plinio.methods.pit.nn import PITVIT
+from plinio.methods.pit.nn.vit import VIT
 import torchvision
 import torch.optim as optim
 import torchvision.transforms as transforms
@@ -19,35 +18,37 @@ import os
 from tqdm import tqdm
 import wandb
 
-# train the model on cifar10
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+device = 'cuda:3'
+dev_id = int(device[-1])
 
+# relocate memory to specified memory
+def map_location(storage, dev):
+    return storage if dev != 'cpu'else storage.cuda(dev_id)
+    
 # ensure deterministic behavior
 seed = seed_all(seed=42)
 
 # load saved model information
-file_path = 'experiments/floral-frost-58_checkpoint_250.pt'
-checkpoint = torch.load(file_path)
+file_path = '/home/tredese/experiments/generous-pine-228_checkpoint_372.pt'
+checkpoint = torch.load(file_path, map_location = map_location)
 config = checkpoint['config']
+config['learning_rate'] = 1e-4
 
 image_size = config['image_size']
 patch_size = config['patch_size']
-datasets = icl.get_data(dataset=config['dataset'], download=True, image_size=(image_size, image_size))
+datasets = icl.get_data(dataset=config['dataset'], download=True, image_size=(image_size, image_size), data_dir ='~/.cache')
 dataloaders = icl.build_dataloaders(datasets, batch_size=config['batch_size'], num_workers=os.cpu_count(), seed=seed)
 train_dl, val_dl, test_dl = dataloaders
 
 dataset_classes = {'cifar10': 10, 'tiny-imagenet': 200}
 base_model = timm.create_model(config['base_model'], pretrained=True, num_classes=dataset_classes[config['dataset']])
-model = PITVIT.from_timm(base_model, (image_size,) * 2)
-model.cascade_wiring()
-model.load_state_dict(checkpoint['model_state_dict'])
+pit = PITVIT.from_timm(base_model, (image_size,) * 2)
+pit.load_state_dict(checkpoint['model_state_dict'])
+pit.set_in_features_calculators()
+model = VIT.from_pit(pit)
 model = model.to(device)
 
-nas_names, nas_parameters = zip(*model.named_nas_parameters())
-parameters = list(map(lambda x: x[1], filter(lambda x: x[0] not in nas_names, model.named_parameters())))
-optimizer = optim.AdamW([{'params': parameters, 'lr': config['learning_rate'], 'weight_decay': config['weight_decay']}])
-for nas_parameter in nas_parameters:
-    nas_parameter.requires_grad = False
+optimizer = optim.AdamW(model.parameters(), lr = config['learning_rate'], weight_decay= config['weight_decay'])
 scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['epochs'], eta_min=0)
 criterion = SoftTargetCrossEntropy()
 
@@ -66,9 +67,9 @@ def evaluate(model, data_loader):
             correct += pred.eq(target.view_as(pred)).sum().item()
         loss = loss / len(data_loader.dataset)
         correct /= len(data_loader.dataset)
-        return loss, correct, model.get_size_binarized()
+        return loss, correct 
 
-def train(train_loader, model, optimizer, scheduler, criterion, size_lambda, frequency=10):
+def train(train_loader, model, optimizer, scheduler, criterion, frequency=10):
     model.train()
     mixup = Mixup(mixup_alpha=0.8, cutmix_alpha=1.0, label_smoothing=0.1, num_classes=model.n_classes)
     random_erasing = RandomErasing(probability=0.25, mode='pixel', device = device)
@@ -79,7 +80,7 @@ def train(train_loader, model, optimizer, scheduler, criterion, size_lambda, fre
         data = random_erasing(data)
         with torch.cuda.amp.autocast():
             output = model(data)
-            loss = criterion(output, target) + size_lambda * model.get_size()
+            loss = criterion(output, target)
         scaler.scale(loss).backward()
         # gradient accumulation
         if (batch_idx + 1) % frequency == 0 or batch_idx == len(train_loader) - 1:
@@ -102,31 +103,26 @@ def checkpoint(model, optimizer, scheduler, name, epoch, config):
 
 # initialize wandb
 accuracy_stop = EarlyStopping(mode='max', patience=10)
-size_stop = EarlyStopping(mode='min', patience=10)
-run = wandb.init(project='pit-vit-fixed-mask', config=config)
+run = wandb.init(project='vit-finetuning', config=config)
 wandb.watch(model)
+
+test_loss, test_accuracy = evaluate(model, test_dl)
+model_size = sum(p.numel() for p in model.parameters())
+print(f"BEFORE TRAINING: TEST loss: {test_loss}, accuracy: {test_accuracy}, size {model_size} ")
 
 for epoch in range(config['epochs']):
     print(f"Epoch {epoch}")
-    train(train_dl, model, optimizer, scheduler, criterion, size_lambda=config['size_lambda'], frequency=config['weight_update_frequency'])
-    train_loss, train_accuracy, _, = evaluate(model, train_dl)
-    print(f"TRAIN loss: {train_loss}, accuracy: {train_accuracy}")
-    val_loss, val_accuracy, _ = evaluate(model, val_dl)
+    train(train_dl, model, optimizer, scheduler, criterion, frequency=config['weight_update_frequency'])
+    val_loss, val_accuracy  = evaluate(model, val_dl)
     print(f"VAL loss: {val_loss}, accuracy: {val_accuracy}")
-    test_loss, test_accuracy, model_size = evaluate(model, test_dl)
-    print(f"TEST loss: {test_loss}, accuracy: {test_accuracy}, model size: {model_size}")
-    metrics = {'train_loss': train_loss, 'train_accuracy': train_accuracy,\
-               'val_loss': val_loss, 'val_accuracy': val_accuracy, \
-               'test_loss': test_loss, 'test_accuracy': test_accuracy, \
-               'model_size': model_size}
-    layers_params = dict()
-    for name, param in model.named_modules():
-        if isinstance(param, PITConv2d) or isinstance(param, PITLinear):
-            layers_params[f"{name}"] = param.out_features_opt
-    wandb.log(add_prefix("metrics/", metrics) | add_prefix("layers_masks/", layers_params))
+    test_loss, test_accuracy = evaluate(model, test_dl)
+    print(f"TEST loss: {test_loss}, accuracy: {test_accuracy}")
+    metrics = { 'val_loss': val_loss, 'val_accuracy': val_accuracy, \
+               'test_loss': test_loss, 'test_accuracy': test_accuracy}
+    wandb.log(add_prefix("metrics/", metrics))
     if epoch and epoch % config['checkpoint_frequency'] == 0:
         checkpoint(model, optimizer, scheduler, run.name, epoch, config)
-    if accuracy_stop(val_accuracy) and size_stop(model_size):
+    if accuracy_stop(val_accuracy):
         checkpoint(model, optimizer, scheduler, run.name, epoch, config)
         print("Early stopping!")
         break
